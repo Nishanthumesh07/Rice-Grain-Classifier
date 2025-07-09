@@ -23,105 +23,98 @@ def process_image(path):
         raise ValueError(f"Could not read image from {path}")
 
     result_img = img.copy()
+    h, w = img.shape[:2]
 
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Step 1: Convert to HSV
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # Threshold (rice is white on black)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Step 2: Mask light regions (white, yellowish rice)
+    mask_light = cv2.inRange(hsv, (0, 0, 150), (180, 80, 255))
+    mask_color = cv2.inRange(hsv, (10, 40, 80), (40, 150, 255))
+    mask = cv2.bitwise_or(mask_light, mask_color)
 
-    # Morphological cleaning
+    # Fallback: If nothing found, use adaptive threshold
+    if np.sum(mask) < 5000:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        mask = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            11, 2
+        )
+
+    # Step 3: Morphological cleaning
     kernel = np.ones((3, 3), np.uint8)
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     cleaned = cv2.dilate(cleaned, kernel, iterations=1)
 
-    # Contour detection
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Step 4: Distance transform + Watershed to split merged grains
+    dist_transform = cv2.distanceTransform(cleaned, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist_transform, 0.4 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+    sure_bg = cv2.dilate(cleaned, kernel, iterations=3)
+    unknown = cv2.subtract(sure_bg, sure_fg)
 
-    # Store grain measurements
-    grain_data = []
+    # Connected components
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+    markers = cv2.watershed(img, markers)
+
+    # Step 5: Extract contours
+    contours = []
+    for label in np.unique(markers):
+        if label <= 1:
+            continue
+        mask_label = np.uint8(markers == label) * 255
+        cnts, _ = cv2.findContours(mask_label, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours += cnts
+
+    # Step 6: Filter and measure
+    grains = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 100:
+        if area < 50:
             continue
-
         rect = cv2.minAreaRect(cnt)
         (cx, cy), (width, height), angle = rect
         length = max(width, height)
-        aspect_ratio = length / (min(width, height) + 1e-5)
+        grains.append((rect, length))
 
-        grain_data.append({
-            "contour": cnt,
-            "rect": rect,
-            "area": area,
-            "length": length,
-            "aspect_ratio": aspect_ratio
-        })
-
-    if not grain_data:
-        # Nothing found
-        summary = "No grains detected"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        (text_w, text_h), _ = cv2.getTextSize(summary, font, 0.6, 2)
-        x, y = 10, result_img.shape[0] - 10
-        cv2.rectangle(result_img,
-                      (x - 5, y - text_h - 5),
-                      (x + text_w + 5, y + 5),
-                      (0, 0, 0), -1)
-        cv2.putText(result_img, summary, (x, y),
-                    font, 0.6, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+    if not grains:
+        cv2.putText(result_img, "No grains detected", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         return result_img
 
-    # Adaptive threshold for broken vs whole
-    lengths = sorted([g["length"] for g in grain_data], reverse=True)
-
-    if len(lengths) <= 3:
-        # Few grains → fixed ratio cutoff
-        reference_length = lengths[0]
-        broken_length_threshold = 0.75 * reference_length
-    else:
-        # Many grains → median of top 20%
-        top_count = max(3, len(lengths) // 5)
-        top_lengths = lengths[:top_count]
-        reference_length = np.median(top_lengths)
-        broken_length_threshold = 0.65 * reference_length
+    # Step 7: Classify relative
+    lengths = sorted([length for _, length in grains], reverse=True)
+    top_N = max(3, len(lengths) // 5)
+    reference_length = np.median(lengths[:top_N])
+    broken_threshold = 0.65 * reference_length
 
     broken_count = 0
-    whole_count = 0
-
-    for grain in grain_data:
-        rect = grain["rect"]
-        length = grain["length"]
-
-        is_broken = length < broken_length_threshold
-
+    for rect, length in grains:
+        is_broken = length < broken_threshold
         if is_broken:
-            color = (0, 0, 255)  # Red for broken
+            color = (0, 0, 255)  # Red only for broken
+            box = cv2.boxPoints(rect)
+            box = np.intp(box)
+            cv2.drawContours(result_img, [box], 0, color, 2)
             broken_count += 1
-        else:
-            color = (0, 255, 0)  # Green for whole
-            whole_count += 1
 
-        box = cv2.boxPoints(rect)
-        box = box.astype(int)
-        cv2.drawContours(result_img, [box], 0, color, 2)
-
-    # Draw summary
-    summary = f"Broken: {broken_count}, Whole: {whole_count}"
+    # Step 8: Annotate result — ONLY broken count
+    summary = f"Broken: {broken_count}"
     font = cv2.FONT_HERSHEY_SIMPLEX
     (text_w, text_h), _ = cv2.getTextSize(summary, font, 0.6, 2)
-    x, y = 10, result_img.shape[0] - 10
-
     cv2.rectangle(result_img,
-                  (x - 5, y - text_h - 5),
-                  (x + text_w + 5, y + 5),
+                  (10, h - 10 - text_h - 10),
+                  (10 + text_w + 10, h - 10),
                   (0, 0, 0), -1)
-
-    cv2.putText(result_img, summary, (x, y),
-                font, 0.6, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+    cv2.putText(result_img, summary, (15, h - 15),
+                font, 0.6, (255, 255, 255), 2)
 
     return result_img
-
 
 
 @app.route('/', methods=['GET', 'POST'])
@@ -145,3 +138,5 @@ def index():
         return render_template('index.html', uploaded_image=result_path)
     return render_template('index.html')
 
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True)
